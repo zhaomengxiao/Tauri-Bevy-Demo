@@ -33,6 +33,7 @@ use bevy::{
     window::ExitCondition,
 };
 use crossbeam_channel::{Receiver, Sender};
+use image::{codecs::jpeg::JpegEncoder, ImageBuffer, ImageEncoder, Rgba};
 use serde::{Deserialize, Serialize};
 use std::{
     sync::{
@@ -42,7 +43,7 @@ use std::{
     thread,
     time::Duration,
 };
-use tauri::State;
+use tauri::{http::Response as HttpResponse, State};
 
 // =============================================================================
 // Configuration
@@ -85,6 +86,29 @@ pub struct PerformanceStats {
 }
 
 // =============================================================================
+// Mouse Input for Camera Control
+// =============================================================================
+
+/// Mouse input state received from frontend
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub struct MouseInput {
+    /// Accumulated X movement delta
+    pub delta_x: f32,
+    /// Accumulated Y movement delta
+    pub delta_y: f32,
+    /// Accumulated scroll wheel delta
+    pub scroll_delta: f32,
+    /// Left mouse button is pressed
+    pub left_button: bool,
+    /// Right mouse button is pressed
+    pub right_button: bool,
+}
+
+/// Thread-safe mouse input shared between Tauri and Bevy
+#[derive(Clone, Default)]
+pub struct SharedMouseInput(Arc<Mutex<MouseInput>>);
+
+// =============================================================================
 // Channel Communication (Main World <-> Render World)
 // =============================================================================
 
@@ -103,8 +127,40 @@ struct RenderWorldSender(Sender<Vec<u8>>);
 #[derive(Component)]
 struct OffscreenCamera;
 
+/// Marker component for camera that can be controlled by mouse input
+#[derive(Component)]
+struct CameraController;
+
 #[derive(Component)]
 struct RotatingCube;
+
+/// Orbit camera state for spherical coordinate camera control
+#[derive(Resource)]
+struct OrbitCameraState {
+    /// Horizontal rotation angle (radians)
+    yaw: f32,
+    /// Vertical rotation angle (radians), clamped to avoid gimbal lock
+    pitch: f32,
+    /// Distance from the camera to the center point
+    distance: f32,
+    /// The point the camera orbits around
+    center: Vec3,
+}
+
+impl Default for OrbitCameraState {
+    fn default() -> Self {
+        Self {
+            yaw: 0.0,
+            pitch: 0.4, // Slight downward angle
+            distance: 6.5,
+            center: Vec3::ZERO,
+        }
+    }
+}
+
+/// Resource to hold shared mouse input in Bevy
+#[derive(Resource)]
+struct MouseInputRes(SharedMouseInput);
 
 #[derive(Resource)]
 struct RenderTargetHandle(Handle<Image>);
@@ -130,6 +186,28 @@ struct PerfStatsRes(SharedPerfStats);
 struct FrameTimings {
     last_print_time: f64,
     frame_times: Vec<f64>,
+}
+
+/// Frame rate limiter to control output FPS
+#[derive(Resource)]
+struct FrameRateLimiter {
+    last_frame_time: std::time::Instant,
+    min_frame_interval: Duration,
+}
+
+impl FrameRateLimiter {
+    fn new(target_fps: f64) -> Self {
+        Self {
+            last_frame_time: std::time::Instant::now(),
+            min_frame_interval: Duration::from_secs_f64(1.0 / target_fps),
+        }
+    }
+}
+
+impl Default for FrameRateLimiter {
+    fn default() -> Self {
+        Self::new(60.0) // Default to 60 FPS
+    }
 }
 
 // =============================================================================
@@ -329,7 +407,8 @@ fn setup_scene(
         &render_device,
     ));
 
-    // Camera
+    // Camera with orbit controller
+    // Initial position will be set by update_camera_from_input based on OrbitCameraState
     commands.spawn((
         Camera3d::default(),
         Camera {
@@ -340,6 +419,7 @@ fn setup_scene(
         Tonemapping::None,
         Transform::from_xyz(0.0, 2.5, 6.0).looking_at(Vec3::ZERO, Vec3::Y),
         OffscreenCamera,
+        CameraController,
     ));
 
     // Main cube (blue)
@@ -408,6 +488,74 @@ fn rotate_cubes(time: Res<Time>, mut query: Query<&mut Transform, With<RotatingC
     }
 }
 
+/// Update camera transform based on mouse input
+/// Implements orbit camera control:
+/// - Left button drag: rotate camera (yaw/pitch)
+/// - Scroll wheel: zoom (adjust distance)
+fn update_camera_from_input(
+    mouse_input_res: Option<Res<MouseInputRes>>,
+    mut orbit_state: ResMut<OrbitCameraState>,
+    mut camera_query: Query<&mut Transform, With<CameraController>>,
+) {
+    let Some(mouse_res) = mouse_input_res else {
+        return;
+    };
+
+    // Read and clear accumulated input
+    let input = {
+        let mut guard = match mouse_res.0 .0.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        let input = guard.clone();
+        // Clear accumulated deltas after reading
+        guard.delta_x = 0.0;
+        guard.delta_y = 0.0;
+        guard.scroll_delta = 0.0;
+        input
+    };
+
+    // Rotation sensitivity
+    const ROTATION_SPEED: f32 = 0.005;
+    // Zoom sensitivity
+    const ZOOM_SPEED: f32 = 0.5;
+    // Min/max distance limits
+    const MIN_DISTANCE: f32 = 2.0;
+    const MAX_DISTANCE: f32 = 20.0;
+    // Pitch limits to prevent flipping (slightly less than 90 degrees)
+    const MAX_PITCH: f32 = 1.5;
+    const MIN_PITCH: f32 = -1.5;
+
+    // Apply rotation when left button is held
+    if input.left_button && (input.delta_x != 0.0 || input.delta_y != 0.0) {
+        orbit_state.yaw -= input.delta_x * ROTATION_SPEED;
+        orbit_state.pitch -= input.delta_y * ROTATION_SPEED;
+
+        // Clamp pitch to prevent camera flipping
+        orbit_state.pitch = orbit_state.pitch.clamp(MIN_PITCH, MAX_PITCH);
+    }
+
+    // Apply zoom from scroll wheel
+    if input.scroll_delta != 0.0 {
+        orbit_state.distance -= input.scroll_delta * ZOOM_SPEED;
+        orbit_state.distance = orbit_state.distance.clamp(MIN_DISTANCE, MAX_DISTANCE);
+    }
+
+    // Update camera transform based on orbit state
+    for mut transform in camera_query.iter_mut() {
+        // Calculate camera position using spherical coordinates
+        // yaw: rotation around Y axis
+        // pitch: rotation around X axis (elevation)
+        let x = orbit_state.distance * orbit_state.pitch.cos() * orbit_state.yaw.sin();
+        let y = orbit_state.distance * orbit_state.pitch.sin();
+        let z = orbit_state.distance * orbit_state.pitch.cos() * orbit_state.yaw.cos();
+
+        let camera_position = orbit_state.center + Vec3::new(x, y, z);
+        *transform =
+            Transform::from_translation(camera_position).looking_at(orbit_state.center, Vec3::Y);
+    }
+}
+
 fn extract_and_process_frame(
     receiver: Res<MainWorldReceiver>,
     buffer: Option<Res<FrameBufferRes>>,
@@ -415,6 +563,7 @@ fn extract_and_process_frame(
     mut count: ResMut<FrameCount>,
     mut pre_roll: ResMut<PreRollFrames>,
     mut timings: ResMut<FrameTimings>,
+    mut frame_limiter: ResMut<FrameRateLimiter>,
     time: Res<Time>,
 ) {
     let Some(b) = buffer else { return };
@@ -428,6 +577,16 @@ fn extract_and_process_frame(
         }
         return;
     }
+
+    // Frame rate limiting - skip if not enough time has passed
+    let now = std::time::Instant::now();
+    let elapsed = now.duration_since(frame_limiter.last_frame_time);
+    if elapsed < frame_limiter.min_frame_interval {
+        // Drain the receiver but don't process - too early for next frame
+        while receiver.try_recv().is_ok() {}
+        return;
+    }
+    frame_limiter.last_frame_time = now;
 
     let frame_start = std::time::Instant::now();
 
@@ -536,7 +695,11 @@ fn remove_row_padding(data: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
 // Bevy App Setup
 // =============================================================================
 
-fn create_app(frame_buffer: SharedFrameBuffer, perf_stats: SharedPerfStats) -> App {
+fn create_app(
+    frame_buffer: SharedFrameBuffer,
+    perf_stats: SharedPerfStats,
+    mouse_input: SharedMouseInput,
+) -> App {
     let mut app = App::new();
 
     // Use DefaultPlugins but configure for headless operation
@@ -561,23 +724,31 @@ fn create_app(frame_buffer: SharedFrameBuffer, perf_stats: SharedPerfStats) -> A
     // Our systems
     app.add_systems(Startup, setup_scene);
     app.add_systems(Update, rotate_cubes);
+    app.add_systems(Update, update_camera_from_input);
     app.add_systems(Last, extract_and_process_frame);
 
     // Resources
     app.insert_resource(FrameBufferRes(frame_buffer));
     app.insert_resource(PerfStatsRes(perf_stats));
+    app.insert_resource(MouseInputRes(mouse_input));
+    app.insert_resource(OrbitCameraState::default());
     app.insert_resource(FrameCount::default());
     app.insert_resource(PreRollFrames(30)); // Wait 30 frames (~0.5s at 60 FPS) for scene to stabilize
     app.insert_resource(FrameTimings::default());
+    app.insert_resource(FrameRateLimiter::default()); // Limit output to 60 FPS
 
     println!("[Bevy] App configured (headless mode with proper GPU-CPU pipeline)");
     app
 }
 
-fn start_bevy(buffer: SharedFrameBuffer, perf_stats: SharedPerfStats) {
+fn start_bevy(
+    buffer: SharedFrameBuffer,
+    perf_stats: SharedPerfStats,
+    mouse_input: SharedMouseInput,
+) {
     thread::spawn(move || {
         println!("[Bevy] Thread started");
-        let mut app = create_app(buffer, perf_stats);
+        let mut app = create_app(buffer, perf_stats, mouse_input);
         println!("[Bevy] Running render loop...");
         app.run();
     });
@@ -635,6 +806,28 @@ fn get_performance_stats(state: State<SharedPerfStats>) -> Result<PerformanceSta
     Ok(guard.clone())
 }
 
+/// Receive mouse input from frontend for camera control
+/// Input deltas are accumulated until consumed by Bevy
+#[tauri::command]
+fn send_mouse_input(
+    state: State<SharedMouseInput>,
+    delta_x: f32,
+    delta_y: f32,
+    scroll_delta: f32,
+    left_button: bool,
+    right_button: bool,
+) -> Result<(), String> {
+    let mut guard = state.0.lock().map_err(|e| e.to_string())?;
+    // Accumulate deltas (will be cleared when Bevy reads them)
+    guard.delta_x += delta_x;
+    guard.delta_y += delta_y;
+    guard.scroll_delta += scroll_delta;
+    // Button state is just the current state
+    guard.left_button = left_button;
+    guard.right_button = right_button;
+    Ok(())
+}
+
 // =============================================================================
 // Entry Point
 // =============================================================================
@@ -645,19 +838,156 @@ pub fn run() {
 
     let buffer = SharedFrameBuffer::default();
     let perf_stats = SharedPerfStats::default();
-    start_bevy(buffer.clone(), perf_stats.clone());
+    let mouse_input = SharedMouseInput::default();
+    start_bevy(buffer.clone(), perf_stats.clone(), mouse_input.clone());
 
     // Wait for Bevy to initialize
     thread::sleep(Duration::from_millis(1000));
+
+    // Clone for the custom protocol handler
+    let protocol_buffer = buffer.clone();
+    let protocol_perf_stats = perf_stats.clone();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(buffer)
         .manage(perf_stats)
+        .manage(mouse_input)
+        // Register custom protocol "frame://" for direct binary transfer
+        // This bypasses Tauri IPC JSON serialization completely!
+        .register_asynchronous_uri_scheme_protocol("frame", move |_ctx, request, responder| {
+            let buffer = protocol_buffer.clone();
+            let perf_stats = protocol_perf_stats.clone();
+
+            // Handle the request in a separate thread to avoid blocking
+            std::thread::spawn(move || {
+                let uri = request.uri();
+                let uri_str = uri.to_string();
+                let path = uri.path();
+                let host = uri.host().unwrap_or("");
+
+                // Debug logging
+                println!(
+                    "[Protocol] Request URI: {}, host: {}, path: {}",
+                    uri_str, host, path
+                );
+
+                // For Tauri v2, URL format is: http://frame.localhost/path
+                // So we extract the resource from the path
+                let resource = path.trim_start_matches('/');
+
+                println!("[Protocol] Resolved resource: {}", resource);
+
+                match resource {
+                    // JPEG compressed frame - much smaller data size!
+                    "frame" | "frame.jpg" => {
+                        let guard = buffer.0.lock().unwrap();
+                        match &*guard {
+                            Some(rgba_data) => {
+                                // Compress RGBA to JPEG - reduces ~1.8MB to ~50-100KB!
+                                let img: ImageBuffer<Rgba<u8>, Vec<u8>> = ImageBuffer::from_raw(
+                                    RENDER_WIDTH,
+                                    RENDER_HEIGHT,
+                                    rgba_data.clone(),
+                                )
+                                .unwrap();
+
+                                // Convert RGBA to RGB for JPEG (no alpha channel)
+                                let rgb_img = image::DynamicImage::ImageRgba8(img).to_rgb8();
+
+                                // Encode to JPEG with quality 85 (good balance of size vs quality)
+                                let mut jpeg_data = Vec::new();
+                                let encoder = JpegEncoder::new_with_quality(&mut jpeg_data, 85);
+                                encoder
+                                    .write_image(
+                                        rgb_img.as_raw(),
+                                        RENDER_WIDTH,
+                                        RENDER_HEIGHT,
+                                        image::ExtendedColorType::Rgb8,
+                                    )
+                                    .unwrap();
+
+                                let response = HttpResponse::builder()
+                                    .status(200)
+                                    .header("Content-Type", "image/jpeg")
+                                    .header("X-Frame-Width", RENDER_WIDTH.to_string())
+                                    .header("X-Frame-Height", RENDER_HEIGHT.to_string())
+                                    .header("Access-Control-Allow-Origin", "*")
+                                    .header(
+                                        "Access-Control-Expose-Headers",
+                                        "X-Frame-Width, X-Frame-Height",
+                                    )
+                                    .body(jpeg_data)
+                                    .unwrap();
+                                responder.respond(response);
+                            }
+                            None => {
+                                let response = HttpResponse::builder()
+                                    .status(503)
+                                    .header("Content-Type", "text/plain")
+                                    .body("Frame not ready".as_bytes().to_vec())
+                                    .unwrap();
+                                responder.respond(response);
+                            }
+                        }
+                    }
+                    // Raw RGBA frame (for comparison/debugging)
+                    "frame.raw" => {
+                        let guard = buffer.0.lock().unwrap();
+                        match &*guard {
+                            Some(rgba_data) => {
+                                let response = HttpResponse::builder()
+                                    .status(200)
+                                    .header("Content-Type", "application/octet-stream")
+                                    .header("X-Frame-Width", RENDER_WIDTH.to_string())
+                                    .header("X-Frame-Height", RENDER_HEIGHT.to_string())
+                                    .header("Access-Control-Allow-Origin", "*")
+                                    .header(
+                                        "Access-Control-Expose-Headers",
+                                        "X-Frame-Width, X-Frame-Height",
+                                    )
+                                    .body(rgba_data.clone())
+                                    .unwrap();
+                                responder.respond(response);
+                            }
+                            None => {
+                                let response = HttpResponse::builder()
+                                    .status(503)
+                                    .header("Content-Type", "text/plain")
+                                    .body("Frame not ready".as_bytes().to_vec())
+                                    .unwrap();
+                                responder.respond(response);
+                            }
+                        }
+                    }
+                    "stats" => {
+                        // Return performance stats as JSON (small data, OK to use JSON)
+                        let guard = perf_stats.0.lock().unwrap();
+                        let json = serde_json::to_vec(&*guard).unwrap_or_default();
+                        let response = HttpResponse::builder()
+                            .status(200)
+                            .header("Content-Type", "application/json")
+                            .header("Access-Control-Allow-Origin", "*")
+                            .body(json)
+                            .unwrap();
+                        responder.respond(response);
+                    }
+                    _ => {
+                        let response = HttpResponse::builder()
+                            .status(404)
+                            .header("Content-Type", "text/plain")
+                            .body("Not Found".as_bytes().to_vec())
+                            .unwrap();
+                        responder.respond(response);
+                    }
+                }
+            });
+        })
         .invoke_handler(tauri::generate_handler![
             get_frame,
             get_render_size,
-            get_performance_stats
+            get_performance_stats,
+            send_mouse_input
         ])
         .run(tauri::generate_context!())
         .expect("Tauri error");

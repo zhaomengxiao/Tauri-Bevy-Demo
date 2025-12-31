@@ -34,8 +34,8 @@ bevy = { version = "0.17.3", default-features = false, features = [
 ] }
 # For base64 encoding of frame data
 base64 = "0.22"
-# For PNG encoding
-image = { version = "0.25", default-features = false, features = ["png"] }
+# For image encoding (JPEG for fast compression, PNG as fallback)
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 # For cross-thread communication in render pipeline
 crossbeam-channel = "0.5"
 

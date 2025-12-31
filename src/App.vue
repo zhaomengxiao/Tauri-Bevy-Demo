@@ -20,12 +20,7 @@ import { invoke } from "@tauri-apps/api/core";
 // Types
 // =============================================================================
 
-/** Response from the get_frame Tauri command */
-interface FrameResponse {
-  data: string; // Base64-encoded RGBA pixel data
-  width: number;
-  height: number;
-}
+// FrameResponse no longer needed - using custom protocol with direct binary transfer
 
 /** Performance statistics from Rust backend */
 interface PerformanceStats {
@@ -96,19 +91,131 @@ let fpsLastUpdate = performance.now();
 let frontendPerfSamples: FrontendPerf[] = [];
 
 // =============================================================================
+// Mouse Input State for Camera Control
+// =============================================================================
+
+/** Track mouse button states */
+const mouseState = {
+  leftButton: false,
+  rightButton: false,
+  lastX: 0,
+  lastY: 0,
+};
+
+/**
+ * Send mouse input to Bevy for camera control
+ * Uses accumulated deltas to ensure smooth movement even at different frame rates
+ */
+async function sendMouseInput(
+  deltaX: number,
+  deltaY: number,
+  scrollDelta: number,
+  leftButton: boolean,
+  rightButton: boolean
+) {
+  try {
+    await invoke("send_mouse_input", {
+      deltaX,
+      deltaY,
+      scrollDelta,
+      leftButton,
+      rightButton,
+    });
+  } catch (error) {
+    // Silently ignore errors to avoid spamming console during rapid input
+  }
+}
+
+/**
+ * Handle mouse down events on canvas
+ */
+function handleMouseDown(event: MouseEvent) {
+  if (event.button === 0) {
+    mouseState.leftButton = true;
+  } else if (event.button === 2) {
+    mouseState.rightButton = true;
+  }
+  mouseState.lastX = event.clientX;
+  mouseState.lastY = event.clientY;
+
+  // Prevent default context menu on right click
+  event.preventDefault();
+}
+
+/**
+ * Handle mouse up events (on window to catch releases outside canvas)
+ */
+function handleMouseUp(event: MouseEvent) {
+  if (event.button === 0) {
+    mouseState.leftButton = false;
+    // Send final state update when button is released
+    sendMouseInput(0, 0, 0, false, mouseState.rightButton);
+  } else if (event.button === 2) {
+    mouseState.rightButton = false;
+    sendMouseInput(0, 0, 0, mouseState.leftButton, false);
+  }
+}
+
+/**
+ * Handle mouse move events on canvas
+ * Only sends input when a button is pressed (drag behavior)
+ */
+function handleMouseMove(event: MouseEvent) {
+  if (!mouseState.leftButton && !mouseState.rightButton) {
+    return;
+  }
+
+  const deltaX = event.clientX - mouseState.lastX;
+  const deltaY = event.clientY - mouseState.lastY;
+  mouseState.lastX = event.clientX;
+  mouseState.lastY = event.clientY;
+
+  // Send mouse movement delta to Bevy
+  sendMouseInput(
+    deltaX,
+    deltaY,
+    0,
+    mouseState.leftButton,
+    mouseState.rightButton
+  );
+}
+
+/**
+ * Handle mouse wheel events for zooming
+ */
+function handleWheel(event: WheelEvent) {
+  // Prevent page scroll
+  event.preventDefault();
+
+  // Normalize scroll delta (different browsers report different values)
+  // deltaY is positive when scrolling down (zoom out), negative when up (zoom in)
+  const scrollDelta = -event.deltaY * 0.01;
+
+  sendMouseInput(0, 0, scrollDelta, mouseState.leftButton, mouseState.rightButton);
+}
+
+/**
+ * Prevent context menu on right click
+ */
+function handleContextMenu(event: MouseEvent) {
+  event.preventDefault();
+}
+
+// =============================================================================
 // Render Loop
 // =============================================================================
 
 /**
  * Main render loop that fetches frames from Bevy and draws them to canvas.
  *
- * How it works:
- * 1. Call Tauri's invoke() to request the latest frame from Rust
- * 2. Decode the Base64 PNG data into an Image object
- * 3. Draw the image onto the canvas
- * 4. Schedule the next frame using requestAnimationFrame
+ * OPTIMIZED: Uses custom protocol "frame://" for direct binary transfer
+ * This completely bypasses Tauri IPC JSON serialization!
  *
- * C++ analogy: Similar to a game's main loop that polls for input and renders
+ * How it works:
+ * 1. fetch('frame://localhost/frame') returns raw RGBA ArrayBuffer
+ * 2. Create ImageData directly from ArrayBuffer (no Base64 decode!)
+ * 3. Draw to canvas
+ * 4. Schedule next frame with requestAnimationFrame
  */
 async function renderLoop() {
   if (!isRendering.value) return;
@@ -128,32 +235,37 @@ async function renderLoop() {
   }
 
   try {
-    // Measure Tauri call time
-    const tauriStart = performance.now();
-    const response = await invoke<FrameResponse>("get_frame");
-    const tauriTime = performance.now() - tauriStart;
-
-    // Measure Base64 decoding + ImageData creation time
-    const imageStart = performance.now();
-    // Decode Base64 to binary
-    const binaryString = atob(response.data);
-    const bytes = new Uint8ClampedArray(binaryString.length);
-    for (let i = 0; i < binaryString.length; i++) {
-      bytes[i] = binaryString.charCodeAt(i);
+    // OPTIMIZED: Use custom protocol with JPEG compression
+    // Data size reduced from ~1.8MB to ~50-100KB!
+    // Tauri v2 custom protocol URL format: http://<scheme>.localhost/<path>
+    const fetchStart = performance.now();
+    const response = await fetch("http://frame.localhost/frame");
+    
+    if (!response.ok) {
+      throw new Error(`Frame fetch failed: ${response.status}`);
     }
-    const imageData = new ImageData(bytes, response.width, response.height);
+    
+    // Get JPEG blob directly
+    const blob = await response.blob();
+    const fetchTime = performance.now() - fetchStart;
+
+    // Use createImageBitmap for hardware-accelerated JPEG decoding
+    // This is MUCH faster than manual pixel manipulation!
+    const imageStart = performance.now();
+    const imageBitmap = await createImageBitmap(blob);
     const imageTime = performance.now() - imageStart;
 
-    // Measure canvas drawing time
+    // Draw ImageBitmap to canvas (hardware accelerated)
     const drawStart = performance.now();
-    ctx.putImageData(imageData, 0, 0);
+    ctx.drawImage(imageBitmap, 0, 0);
+    imageBitmap.close(); // Release resources
     const drawTime = performance.now() - drawStart;
 
     const totalTime = performance.now() - loopStart;
 
     // Store performance sample
     frontendPerfSamples.push({
-      tauri_call_ms: tauriTime,
+      tauri_call_ms: fetchTime,  // Now measures fetch time instead of invoke
       image_create_ms: imageTime,
       canvas_draw_ms: drawTime,
       total_loop_ms: totalTime,
@@ -299,11 +411,17 @@ onMounted(() => {
   setTimeout(() => {
     startRendering();
   }, 500);
+
+  // Add global mouse up listener (to catch releases outside canvas)
+  window.addEventListener("mouseup", handleMouseUp);
 });
 
 onUnmounted(() => {
   // Clean up when component is destroyed
   stopRendering();
+
+  // Remove global listeners
+  window.removeEventListener("mouseup", handleMouseUp);
 });
 </script>
 
@@ -311,176 +429,189 @@ onUnmounted(() => {
   <main class="app-container">
     <!-- Header Section -->
     <header class="header">
-      <h1 class="title">Tauri + Bevy Demo</h1>
-      <p class="subtitle">Offscreen 3D Rendering in a Web Canvas</p>
+      <div class="header-content">
+        <h1 class="title">Tauri + Bevy Demo</h1>
+        <p class="subtitle">Offscreen 3D Rendering in a Web Canvas</p>
+      </div>
+      <!-- Status Messages in Header -->
+      <div class="status-section">
+        <p class="status-message">{{ statusMessage }}</p>
+        <p v-if="errorMessage" class="error-message">{{ errorMessage }}</p>
+      </div>
     </header>
 
-    <!-- Canvas Section -->
-    <div class="canvas-wrapper">
-      <canvas
-        ref="canvasRef"
-        width="800"
-        height="600"
-        class="render-canvas"
-      ></canvas>
+    <div class="main-layout">
+      <!-- Canvas Section (Left) -->
+      <div class="canvas-section">
+        <div class="canvas-wrapper">
+          <canvas
+            ref="canvasRef"
+            width="800"
+            height="600"
+            class="render-canvas"
+            @mousedown="handleMouseDown"
+            @mousemove="handleMouseMove"
+            @wheel="handleWheel"
+            @contextmenu="handleContextMenu"
+          ></canvas>
 
-      <!-- Overlay Stats -->
-      <div class="stats-overlay">
-        <span class="stat">Frontend FPS: {{ fps }}</span>
-        <span class="stat">Frames: {{ frameCount }}</span>
-      </div>
-    </div>
-
-    <!-- Performance Panel -->
-    <div class="performance-panel">
-      <h3>🔍 Performance Diagnostics</h3>
-      
-      <div class="perf-section">
-        <h4>🦀 Backend (Bevy/Rust)</h4>
-        <div class="perf-grid">
-          <div class="perf-item">
-            <span class="perf-label">Bevy FPS:</span>
-            <span class="perf-value">{{ backendStats.bevy_fps.toFixed(1) }}</span>
-          </div>
-          <div class="perf-item">
-            <span class="perf-label">GPU Transfer:</span>
-            <span class="perf-value" :class="getPerfClass(backendStats.gpu_transfer_ms)">
-              {{ backendStats.gpu_transfer_ms.toFixed(2) }}ms
-            </span>
-          </div>
-          <div class="perf-item">
-            <span class="perf-label">Data Processing:</span>
-            <span class="perf-value" :class="getPerfClass(backendStats.data_processing_ms)">
-              {{ backendStats.data_processing_ms.toFixed(2) }}ms
-            </span>
-          </div>
-          <div class="perf-item">
-            <span class="perf-label">Total Backend:</span>
-            <span class="perf-value" :class="getPerfClass(backendStats.frame_encoding_ms)">
-              {{ backendStats.frame_encoding_ms.toFixed(2) }}ms
-            </span>
-          </div>
-          <div class="perf-item">
-            <span class="perf-label">Data Size:</span>
-            <span class="perf-value">{{ backendStats.data_size_kb.toFixed(1) }} KB</span>
-          </div>
-          <div class="perf-item">
-            <span class="perf-label">Backend Frames:</span>
-            <span class="perf-value">{{ backendStats.frame_count }}</span>
+          <!-- Overlay Stats -->
+          <div class="stats-overlay">
+            <span class="stat">Frontend FPS: {{ fps }}</span>
+            <span class="stat">Frames: {{ frameCount }}</span>
           </div>
         </div>
       </div>
 
-      <div class="perf-section">
-        <h4>🔌 Tauri IPC (Rust → JS)</h4>
-        <div class="perf-grid">
-          <div class="perf-item">
-            <span class="perf-label">Get Frame (Rust):</span>
-            <span class="perf-value" :class="getPerfClass(backendStats.tauri_get_frame_ms)">
-              {{ backendStats.tauri_get_frame_ms.toFixed(2) }}ms
-            </span>
-          </div>
-          <div class="perf-item">
-            <span class="perf-label">Data Clone (Rust):</span>
-            <span class="perf-value" :class="getPerfClass(backendStats.tauri_serialize_ms)">
-              {{ backendStats.tauri_serialize_ms.toFixed(2) }}ms
-            </span>
-          </div>
-          <div class="perf-item">
-            <span class="perf-label">Tauri Call (JS):</span>
-            <span class="perf-value" :class="getPerfClass(frontendStats.tauri_call_ms)">
-              {{ frontendStats.tauri_call_ms.toFixed(2) }}ms
-            </span>
-          </div>
-          <div class="perf-item">
-            <span class="perf-label">🔥 IPC Overhead:</span>
-            <span class="perf-value perf-bad">
-              {{ (frontendStats.tauri_call_ms - backendStats.tauri_get_frame_ms - backendStats.tauri_serialize_ms).toFixed(2) }}ms
-            </span>
+      <!-- Sidebar Section (Right) -->
+      <aside class="sidebar">
+        <!-- Controls -->
+        <div class="sidebar-block controls-block">
+          <div class="controls">
+            <button
+              class="control-btn start"
+              :disabled="isRendering"
+              @click="startRendering"
+            >
+              ▶ Start
+            </button>
+            <button
+              class="control-btn stop"
+              :disabled="!isRendering"
+              @click="stopRendering"
+            >
+              ◼ Stop
+            </button>
           </div>
         </div>
-      </div>
 
-      <div class="perf-section">
-        <h4>⚡ Frontend (Vue/Canvas)</h4>
-        <div class="perf-grid">
-          <div class="perf-item">
-            <span class="perf-label">Frontend FPS:</span>
-            <span class="perf-value">{{ frontendStats.frontend_fps.toFixed(1) }}</span>
-          </div>
-          <div class="perf-item">
-            <span class="perf-label">Tauri Call:</span>
-            <span class="perf-value" :class="getPerfClass(frontendStats.tauri_call_ms)">
-              {{ frontendStats.tauri_call_ms.toFixed(2) }}ms
-            </span>
-          </div>
-          <div class="perf-item">
-            <span class="perf-label">ImageData Create:</span>
-            <span class="perf-value" :class="getPerfClass(frontendStats.image_create_ms)">
-              {{ frontendStats.image_create_ms.toFixed(2) }}ms
-            </span>
-          </div>
-          <div class="perf-item">
-            <span class="perf-label">Canvas Draw:</span>
-            <span class="perf-value" :class="getPerfClass(frontendStats.canvas_draw_ms)">
-              {{ frontendStats.canvas_draw_ms.toFixed(2) }}ms
-            </span>
-          </div>
-          <div class="perf-item">
-            <span class="perf-label">Total Frontend:</span>
-            <span class="perf-value" :class="getPerfClass(frontendStats.total_loop_ms)">
-              {{ frontendStats.total_loop_ms.toFixed(2) }}ms
-            </span>
+        <!-- Performance Panel -->
+        <div class="sidebar-block performance-block">
+          <div class="performance-panel">
+            <h3>🔍 Performance Diagnostics</h3>
+            
+            <div class="perf-section">
+              <h4>🦀 Backend (Bevy/Rust)</h4>
+              <div class="perf-grid">
+                <div class="perf-item">
+                  <span class="perf-label">Bevy FPS:</span>
+                  <span class="perf-value">{{ backendStats.bevy_fps.toFixed(1) }}</span>
+                </div>
+                <div class="perf-item">
+                  <span class="perf-label">GPU Transfer:</span>
+                  <span class="perf-value" :class="getPerfClass(backendStats.gpu_transfer_ms)">
+                    {{ backendStats.gpu_transfer_ms.toFixed(2) }}ms
+                  </span>
+                </div>
+                <div class="perf-item">
+                  <span class="perf-label">Data Processing:</span>
+                  <span class="perf-value" :class="getPerfClass(backendStats.data_processing_ms)">
+                    {{ backendStats.data_processing_ms.toFixed(2) }}ms
+                  </span>
+                </div>
+                <div class="perf-item">
+                  <span class="perf-label">Total Backend:</span>
+                  <span class="perf-value" :class="getPerfClass(backendStats.frame_encoding_ms)">
+                    {{ backendStats.frame_encoding_ms.toFixed(2) }}ms
+                  </span>
+                </div>
+                <div class="perf-item">
+                  <span class="perf-label">Data Size:</span>
+                  <span class="perf-value">{{ backendStats.data_size_kb.toFixed(1) }} KB</span>
+                </div>
+                <div class="perf-item">
+                  <span class="perf-label">Backend Frames:</span>
+                  <span class="perf-value">{{ backendStats.frame_count }}</span>
+                </div>
+              </div>
+            </div>
+
+            <div class="perf-section">
+              <h4>🔌 Tauri IPC</h4>
+              <div class="perf-grid">
+                <div class="perf-item">
+                  <span class="perf-label">Get Frame:</span>
+                  <span class="perf-value" :class="getPerfClass(backendStats.tauri_get_frame_ms)">
+                    {{ backendStats.tauri_get_frame_ms.toFixed(2) }}ms
+                  </span>
+                </div>
+                <div class="perf-item">
+                  <span class="perf-label">Data Clone:</span>
+                  <span class="perf-value" :class="getPerfClass(backendStats.tauri_serialize_ms)">
+                    {{ backendStats.tauri_serialize_ms.toFixed(2) }}ms
+                  </span>
+                </div>
+                <div class="perf-item">
+                  <span class="perf-label">JS Call:</span>
+                  <span class="perf-value" :class="getPerfClass(frontendStats.tauri_call_ms)">
+                    {{ frontendStats.tauri_call_ms.toFixed(2) }}ms
+                  </span>
+                </div>
+                <div class="perf-item">
+                  <span class="perf-label">🔥 Overhead:</span>
+                  <span class="perf-value perf-bad">
+                    {{ (frontendStats.tauri_call_ms - backendStats.tauri_get_frame_ms - backendStats.tauri_serialize_ms).toFixed(2) }}ms
+                  </span>
+                </div>
+              </div>
+            </div>
+
+            <div class="perf-section">
+              <h4>⚡ Frontend (Vue)</h4>
+              <div class="perf-grid">
+                <div class="perf-item">
+                  <span class="perf-label">Total Loop:</span>
+                  <span class="perf-value" :class="getPerfClass(frontendStats.total_loop_ms)">
+                    {{ frontendStats.total_loop_ms.toFixed(2) }}ms
+                  </span>
+                </div>
+                <div class="perf-item">
+                  <span class="perf-label">Draw:</span>
+                  <span class="perf-value" :class="getPerfClass(frontendStats.canvas_draw_ms)">
+                    {{ frontendStats.canvas_draw_ms.toFixed(2) }}ms
+                  </span>
+                </div>
+              </div>
+            </div>
+
+            <div class="perf-analysis">
+              <strong>Analysis:</strong>
+              <span v-if="getTotalLatency() < 16.67" class="analysis-good">
+                ✅ Excellent! ({{ getTotalLatency().toFixed(1) }}ms latency)
+              </span>
+              <span v-else-if="getTotalLatency() < 33.33" class="analysis-warn">
+                ⚠️ Good ({{ getTotalLatency().toFixed(1) }}ms latency)
+              </span>
+              <span v-else class="analysis-bad">
+                ❌ Lag ({{ getTotalLatency().toFixed(1) }}ms latency)
+              </span>
+            </div>
           </div>
         </div>
-      </div>
 
-      <div class="perf-analysis">
-        <strong>Analysis:</strong>
-        <span v-if="getTotalLatency() < 16.67" class="analysis-good">
-          ✅ Excellent! Running at 60+ FPS ({{ getTotalLatency().toFixed(1) }}ms total latency)
-        </span>
-        <span v-else-if="getTotalLatency() < 33.33" class="analysis-warn">
-          ⚠️ Good but could improve ({{ getTotalLatency().toFixed(1) }}ms total latency, targeting 30+ FPS)
-        </span>
-        <span v-else class="analysis-bad">
-          ❌ Performance issue detected ({{ getTotalLatency().toFixed(1) }}ms total latency)
-        </span>
-      </div>
-    </div>
+        <!-- Camera Controls Info -->
+        <div class="sidebar-block info-block">
+          <div class="info-panel">
+            <h3>🎮 Camera Controls</h3>
+            <ul class="controls-list">
+              <li><strong>Left Drag:</strong> Rotate camera</li>
+              <li><strong>Scroll:</strong> Zoom in/out</li>
+            </ul>
+          </div>
+        </div>
 
-    <!-- Controls -->
-    <div class="controls">
-      <button
-        class="control-btn start"
-        :disabled="isRendering"
-        @click="startRendering"
-      >
-        ▶ Start
-      </button>
-      <button
-        class="control-btn stop"
-        :disabled="!isRendering"
-        @click="stopRendering"
-      >
-        ◼ Stop
-      </button>
-    </div>
-
-    <!-- Status Messages -->
-    <div class="status-section">
-      <p class="status-message">{{ statusMessage }}</p>
-      <p v-if="errorMessage" class="error-message">{{ errorMessage }}</p>
-    </div>
-
-    <!-- Info Panel -->
-    <div class="info-panel">
-      <h3>How It Works</h3>
-      <ol>
-        <li><strong>Bevy</strong> renders a 3D scene to an offscreen buffer</li>
-        <li><strong>Tauri</strong> transfers frame data via commands</li>
-        <li><strong>Vue</strong> displays frames on this HTML Canvas</li>
-      </ol>
+        <!-- Info Panel -->
+        <div class="sidebar-block info-block">
+          <div class="info-panel">
+            <h3>How It Works</h3>
+            <ol>
+              <li><strong>Bevy</strong> renders offscreen</li>
+              <li><strong>Tauri</strong> transfers frame data</li>
+              <li><strong>Vue</strong> displays on Canvas</li>
+            </ol>
+          </div>
+        </div>
+      </aside>
     </div>
   </main>
 </template>
@@ -556,55 +687,90 @@ body {
    App Container
    ============================================================================= */
 .app-container {
-  min-height: 100vh;
+  height: 100vh;
+  width: 100vw;
   display: flex;
   flex-direction: column;
-  align-items: center;
-  padding: var(--spacing-lg);
+  padding: 0;
   background: radial-gradient(ellipse at top, #1a1f35 0%, var(--color-bg-primary) 70%);
+  overflow: hidden;
 }
 
 /* =============================================================================
    Header
    ============================================================================= */
 .header {
-  text-align: center;
-  margin-bottom: var(--spacing-lg);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: var(--spacing-md) var(--spacing-lg);
+  border-bottom: 1px solid var(--color-border);
+  background: rgba(10, 14, 23, 0.8);
+  backdrop-filter: blur(8px);
+  z-index: 10;
+}
+
+.header-content {
+  text-align: left;
 }
 
 .title {
-  font-size: var(--font-size-2xl);
+  font-size: var(--font-size-lg);
   font-weight: 700;
   background: var(--color-accent-gradient);
   -webkit-background-clip: text;
   -webkit-text-fill-color: transparent;
   background-clip: text;
-  margin-bottom: var(--spacing-xs);
+  margin-bottom: 2px;
   letter-spacing: -0.5px;
 }
 
 .subtitle {
   color: var(--color-text-secondary);
-  font-size: var(--font-size-base);
+  font-size: var(--font-size-sm);
   font-weight: 400;
+}
+
+/* =============================================================================
+   Main Layout
+   ============================================================================= */
+.main-layout {
+  flex: 1;
+  display: grid;
+  grid-template-columns: 1fr 400px;
+  overflow: hidden;
 }
 
 /* =============================================================================
    Canvas Section
    ============================================================================= */
+.canvas-section {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--spacing-lg);
+  background: rgba(0, 0, 0, 0.2);
+  position: relative;
+  overflow: auto; /* Allow scrolling if canvas is larger than viewport */
+}
+
 .canvas-wrapper {
   position: relative;
-  margin-bottom: var(--spacing-lg);
+  box-shadow: var(--shadow-glow), var(--shadow-card);
+  border-radius: var(--border-radius);
+  background: var(--color-bg-secondary);
+  line-height: 0;
 }
 
 .render-canvas {
   display: block;
-  border: 2px solid var(--color-border);
+  border: 1px solid var(--color-border);
   border-radius: var(--border-radius);
-  background: var(--color-bg-secondary);
-  box-shadow: var(--shadow-glow), var(--shadow-card);
   /* Ensure crisp pixel rendering */
   image-rendering: crisp-edges;
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
 }
 
 .stats-overlay {
@@ -618,6 +784,7 @@ body {
   border-radius: var(--border-radius);
   font-size: var(--font-size-sm);
   font-weight: 500;
+  pointer-events: none;
 }
 
 .stat {
@@ -625,18 +792,35 @@ body {
 }
 
 /* =============================================================================
+   Sidebar
+   ============================================================================= */
+.sidebar {
+  border-left: 1px solid var(--color-border);
+  background: var(--color-bg-secondary);
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+  padding: var(--spacing-md);
+  gap: var(--spacing-md);
+}
+
+.sidebar-block {
+  width: 100%;
+}
+
+/* =============================================================================
    Controls
    ============================================================================= */
 .controls {
-  display: flex;
-  gap: var(--spacing-md);
-  margin-bottom: var(--spacing-lg);
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--spacing-sm);
 }
 
 .control-btn {
-  padding: var(--spacing-sm) var(--spacing-lg);
+  padding: var(--spacing-sm);
   font-family: var(--font-family);
-  font-size: var(--font-size-base);
+  font-size: var(--font-size-sm);
   font-weight: 600;
   border: none;
   border-radius: var(--border-radius);
@@ -644,6 +828,7 @@ body {
   transition: all var(--transition-fast);
   display: flex;
   align-items: center;
+  justify-content: center;
   gap: var(--spacing-xs);
 }
 
@@ -659,8 +844,7 @@ body {
 
 .control-btn.start:hover:not(:disabled) {
   background: #059669;
-  transform: translateY(-2px);
-  box-shadow: 0 4px 12px rgba(16, 185, 129, 0.4);
+  transform: translateY(-1px);
 }
 
 .control-btn.stop {
@@ -670,162 +854,168 @@ body {
 
 .control-btn.stop:hover:not(:disabled) {
   background: #dc2626;
-  transform: translateY(-2px);
-  box-shadow: 0 4px 12px rgba(239, 68, 68, 0.4);
+  transform: translateY(-1px);
 }
 
 /* =============================================================================
    Status Section
    ============================================================================= */
 .status-section {
-  text-align: center;
-  margin-bottom: var(--spacing-lg);
+  text-align: right;
 }
 
 .status-message {
   color: var(--color-text-secondary);
   font-size: var(--font-size-sm);
+  font-weight: 500;
 }
 
 .error-message {
   color: var(--color-error);
-  font-size: var(--font-size-sm);
-  margin-top: var(--spacing-xs);
-}
-
-/* =============================================================================
-   Info Panel
-   ============================================================================= */
-.info-panel {
-  background: var(--color-bg-secondary);
-  border: 1px solid var(--color-border);
-  border-radius: var(--border-radius);
-  padding: var(--spacing-lg);
-  max-width: 500px;
-  width: 100%;
-}
-
-.info-panel h3 {
-  font-size: var(--font-size-lg);
-  color: var(--color-accent-primary);
-  margin-bottom: var(--spacing-md);
-  font-weight: 600;
-}
-
-.info-panel ol {
-  list-style-position: inside;
-  color: var(--color-text-secondary);
-}
-
-.info-panel li {
-  margin-bottom: var(--spacing-sm);
-  line-height: 1.8;
-}
-
-.info-panel strong {
-  color: var(--color-text-primary);
+  font-size: var(--font-size-xs);
+  margin-top: 2px;
 }
 
 /* =============================================================================
    Performance Panel
    ============================================================================= */
 .performance-panel {
-  background: var(--color-bg-secondary);
+  background: var(--color-bg-tertiary);
   border: 1px solid var(--color-border);
   border-radius: var(--border-radius);
-  padding: var(--spacing-lg);
-  max-width: 800px;
-  width: 100%;
-  margin-bottom: var(--spacing-lg);
+  padding: var(--spacing-md);
 }
 
 .performance-panel h3 {
-  font-size: var(--font-size-lg);
+  font-size: var(--font-size-base);
   color: var(--color-accent-primary);
-  margin-bottom: var(--spacing-lg);
+  margin-bottom: var(--spacing-md);
   font-weight: 600;
   text-align: center;
 }
 
 .perf-section {
-  margin-bottom: var(--spacing-lg);
+  margin-bottom: var(--spacing-md);
+}
+
+.perf-section:last-of-type {
+  margin-bottom: var(--spacing-sm);
 }
 
 .perf-section h4 {
-  font-size: var(--font-size-base);
+  font-size: var(--font-size-sm);
   color: var(--color-text-primary);
-  margin-bottom: var(--spacing-md);
+  margin-bottom: var(--spacing-sm);
   font-weight: 600;
   border-bottom: 1px solid var(--color-border);
-  padding-bottom: var(--spacing-xs);
+  padding-bottom: 2px;
 }
 
 .perf-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-  gap: var(--spacing-md);
+  grid-template-columns: 1fr 1fr;
+  gap: var(--spacing-sm);
 }
 
 .perf-item {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: var(--spacing-sm);
-  background: var(--color-bg-tertiary);
+  padding: 6px var(--spacing-sm);
+  background: var(--color-bg-primary);
   border-radius: var(--border-radius);
   border: 1px solid var(--color-border);
 }
 
 .perf-label {
   color: var(--color-text-secondary);
-  font-size: var(--font-size-sm);
+  font-size: 11px;
 }
 
 .perf-value {
   color: var(--color-text-primary);
   font-weight: 600;
-  font-size: var(--font-size-base);
+  font-size: var(--font-size-sm);
 }
 
 /* Performance value color coding */
-.perf-excellent {
-  color: #10b981 !important;
-}
-
-.perf-good {
-  color: #3b82f6 !important;
-}
-
-.perf-warn {
-  color: #f59e0b !important;
-}
-
-.perf-bad {
-  color: #ef4444 !important;
-}
+.perf-excellent { color: #10b981 !important; }
+.perf-good { color: #3b82f6 !important; }
+.perf-warn { color: #f59e0b !important; }
+.perf-bad { color: #ef4444 !important; }
 
 .perf-analysis {
-  padding: var(--spacing-md);
-  background: var(--color-bg-tertiary);
+  padding: var(--spacing-sm);
+  background: var(--color-bg-primary);
   border-radius: var(--border-radius);
-  border-left: 4px solid var(--color-accent-primary);
-  font-size: var(--font-size-sm);
+  border-left: 3px solid var(--color-accent-primary);
+  font-size: var(--font-size-xs);
+  margin-top: var(--spacing-sm);
 }
 
 .perf-analysis strong {
   color: var(--color-accent-primary);
-  margin-right: var(--spacing-xs);
+  margin-right: 4px;
 }
 
-.analysis-good {
-  color: #10b981;
+.analysis-good { color: #10b981; }
+.analysis-warn { color: #f59e0b; }
+.analysis-bad { color: #ef4444; }
+
+/* =============================================================================
+   Info Panel
+   ============================================================================= */
+.info-panel {
+  background: var(--color-bg-tertiary);
+  border: 1px solid var(--color-border);
+  border-radius: var(--border-radius);
+  padding: var(--spacing-md);
 }
 
-.analysis-warn {
-  color: #f59e0b;
+.info-panel h3 {
+  font-size: var(--font-size-sm);
+  color: var(--color-accent-primary);
+  margin-bottom: var(--spacing-sm);
+  font-weight: 600;
 }
 
-.analysis-bad {
-  color: #ef4444;
+.info-panel ol {
+  list-style-position: inside;
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-xs);
+}
+
+.info-panel li {
+  margin-bottom: 4px;
+  line-height: 1.4;
+}
+
+.info-panel strong {
+  color: var(--color-text-primary);
+}
+
+.controls-list {
+  list-style: none;
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-sm);
+}
+
+.controls-list li {
+  margin-bottom: 6px;
+  padding-left: 0;
+}
+
+.controls-list strong {
+  color: var(--color-accent-primary);
+  margin-right: 4px;
+}
+
+/* Make canvas interactive */
+.render-canvas {
+  cursor: grab;
+}
+
+.render-canvas:active {
+  cursor: grabbing;
 }
 </style>
