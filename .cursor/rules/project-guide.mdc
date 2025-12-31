@@ -1,0 +1,170 @@
+---
+alwaysApply: false
+---
+
+# Tauri-Bevy-Demo Project Guide
+
+## Project Overview
+
+**Project Name**: Tauri-Bevy-Demo
+
+**Tech Stack**:
+
+- **Tauri**: Cross-platform desktop application framework (Rust backend + Web frontend)
+- **Vue 3**: Frontend UI framework with TypeScript
+- **Bevy**: Rust game engine for 3D rendering
+
+**Core Objective**: Demonstrate Tauri + Bevy hybrid development using **offscreen rendering** to render Bevy's output into a web canvas with the simplest possible code.
+
+## Developer Background
+
+The developer has a **C++ background** and is **NOT familiar with web technologies or Rust**.
+
+When providing solutions:
+
+- **Explain web concepts**: DOM, Canvas API, JavaScript/TypeScript async patterns, reactive frameworks
+- **Explain Rust concepts**: ownership, borrowing, trait system, async runtime, crate ecosystem
+- **Draw parallels to C++** when helpful (e.g., ownership = unique_ptr, borrowing = references)
+- Keep code simple and educational rather than production-optimized
+
+## Common Commands
+
+### Development
+
+```bash
+# Run the application in development mode
+pnpm tauri dev
+
+# Install dependencies
+pnpm install
+
+# Add Rust dependencies
+cd src-tauri
+cargo add <crate-name>
+# Example: cargo add bevy
+```
+
+### Project Structure
+
+```
+Tauri-Bevy-Demo/
+├── src/              # Vue frontend source
+├── src-tauri/        # Rust backend (Tauri + Bevy)
+│   ├── src/          # Rust source code
+│   ├── Cargo.toml    # Rust dependencies
+│   └── tauri.conf.json
+├── package.json      # Node.js dependencies
+└── vite.config.ts    # Vite bundler config
+```
+
+## Code Style Requirements
+
+### Simplicity First
+
+- Write the **simplest code** that demonstrates the concept
+- Avoid over-engineering or premature optimization
+- Prioritize readability and learning value
+
+### Comments (in English)
+
+- Add comments explaining **WHY**, not just WHAT
+- Explain non-obvious web/Rust patterns
+- Highlight key integration points between Tauri/Bevy
+
+### Educational Explanations
+
+When implementing features, provide:
+
+- **Context**: Why this approach is used
+- **Web/Rust basics**: Explain unfamiliar concepts
+- **Integration points**: How Tauri connects frontend and backend
+
+## Key Technical Points
+
+### 1. Tauri Architecture
+
+- **Frontend**: Runs in a WebView (like a mini browser)
+- **Backend**: Rust application (main process)
+- **Communication**: Frontend calls Rust via `invoke()`, Rust emits events to frontend
+
+### 2. Bevy Offscreen Rendering
+
+- Bevy normally opens its own window
+- For Tauri integration: render to a **headless/offscreen buffer**
+- Transfer rendered frames to frontend canvas
+
+### 3. Canvas Integration
+
+- Frontend: `<canvas>` element receives frame data
+- Use `ImageData` or texture data to update canvas
+- Consider performance: avoid blocking the UI thread
+
+### 4. Data Transfer Optimization
+
+- Large image data transfer can be slow
+- Consider: base64 encoding, binary arrays, shared memory
+- Balance simplicity vs performance for demo purposes
+
+## Common Patterns
+
+### Tauri Command (Rust → exposed to JS)
+
+```rust
+// Define a command that frontend can call
+#[tauri::command]
+fn my_command(param: String) -> String {
+    format!("Received: {}", param)
+}
+
+// Register in main
+fn main() {
+    tauri::Builder::default()
+        .invoke_handler(tauri::generate_handler![my_command])
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+}
+```
+
+### Frontend Invoke (JS → calls Rust)
+
+```typescript
+import { invoke } from "@tauri-apps/api/core";
+
+// Call Rust command from frontend
+const result = await invoke<string>("my_command", { param: "hello" });
+```
+
+### Event Emission (Rust → pushes to JS)
+
+```rust
+// Rust: emit event to frontend
+app_handle.emit_all("frame_ready", frame_data)?;
+```
+
+```typescript
+// Frontend: listen for events
+import { listen } from "@tauri-apps/api/event";
+
+await listen<FrameData>("frame_ready", (event) => {
+  // Update canvas with event.payload
+});
+```
+
+## Problem-Solving Approach
+
+When the developer encounters issues:
+
+1. **Identify the layer**: Is it frontend (Vue/JS), backend (Rust/Bevy), or integration (Tauri)?
+2. **Explain the root cause**: Why did this happen?
+3. **Provide simple solution**: Focus on clarity over cleverness
+4. **Add context**: What web/Rust concept is involved?
+5. **Suggest next steps**: How to build on this solution?
+
+## Learning Resources Context
+
+The developer benefits from:
+
+- **Analogies to C++**: memory management, type systems, build systems
+- **Visual diagrams**: Architecture and data flow
+- **Step-by-step breakdowns**: Async operations, ownership transfers
+- **Practical examples**: Real code snippets over abstract explanations
